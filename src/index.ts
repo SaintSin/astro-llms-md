@@ -134,6 +134,10 @@ function applyTrailingSlash(
   return url.replace(/\/+$/, "");
 }
 
+function markdownPath(urlPath: string): string {
+  return urlPath === "/" ? "/index.md" : `${urlPath}.md`;
+}
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -287,9 +291,7 @@ function generateLlmsTxtContent(
       content += `## ${groupName}\n\n`;
 
       grouped[group].forEach((page) => {
-        const mdUrl = `${siteUrl}${page.urlPath}.md`
-          .replace(/\/\//g, "/")
-          .replace(":/", "://");
+        const mdUrl = `${siteUrl}${markdownPath(page.urlPath)}`;
         const linkText = page.title || page.urlPath;
 
         if (page.description) {
@@ -438,9 +440,10 @@ export async function generateLlmsFiles(config: LlmsConfig): Promise<void> {
     }
 
     for (const page of pages) {
-      const urlPathForFile =
-        page.urlPath === "/" ? "index" : page.urlPath.replace(/^\//, "");
-      const mdPath = join(resolvedOutputDir, urlPathForFile + ".md");
+      const mdPath = join(
+        resolvedOutputDir,
+        markdownPath(page.urlPath).replace(/^\//, ""),
+      );
 
       const mdContent = generateMarkdownFile(page, formatterConfig);
 

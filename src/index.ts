@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import TurndownService from "turndown";
+import { tables } from "turndown-plugin-gfm";
 import { fileURLToPath } from "url";
 
 /* ──────────────────────────────────────────────────────────────────────────────
@@ -250,6 +251,7 @@ export async function processHtml(
       codeBlockStyle: "fenced",
       bulletListMarker: "-",
     });
+    turndownService.use(tables);
 
     turndownService.addRule("removeChrome", {
       filter: ["nav", "footer", "header", "aside"],

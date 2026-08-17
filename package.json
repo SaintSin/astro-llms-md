@@ -1,6 +1,6 @@
 {
   "name": "astro-llms-md",
-  "version": "2.2.2",
+  "version": "3.0.0",
   "description": "Generate llms.txt, llms-full.txt, and individual markdown files from your Astro site with this Astro integration",
   "type": "module",
   "main": "./dist/index.js",
@@ -51,7 +51,7 @@
   },
   "dependencies": {
     "glob": "^13.0.6",
-    "node-html-parser": "^7.1.0",
+    "node-html-parser": "^9.0.1",
     "turndown": "^7.2.4"
   },
   "engines": {
@@ -61,8 +61,8 @@
     "access": "public"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0",
+    "@types/node": "^26.2.0",
     "@types/turndown": "^5.0.6",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   }
 }

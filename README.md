@@ -20,6 +20,7 @@ The `llms.txt` standard helps language models discover and understand your websi
 - ✅ **Astro Integration** - Seamless integration with Astro build process
 - ✅ **Zero-config** - Works out of the box with sensible defaults
 - ✅ **Smart detection** - Auto-detects Astro site URL from config
+- ✅ **SSR/server support** - Works with Astro `output: "server"` builds and SSR-only pages
 - ✅ **TypeScript support** - Full TypeScript type definitions
 - ✅ **Smart cleanup** - Removes disabled file types automatically
 
@@ -106,6 +107,14 @@ All configuration is defined in `astro.config.mjs` via `llms({...})`. The integr
 ```json
 ["404", "404.html", "_astro", "**.xml", "**.txt", "node_modules"]
 ```
+
+### SSR/server output
+
+The integration works with Astro SSR/server builds using `output: "server"`.
+It automatically detects `dist/client/`, includes pre-rendered pages, and
+fetches SSR-only routes from `src/pages/`. If the configured site URL is not
+available, it temporarily starts `dist/server/entry.mjs` to render those pages
+locally.
 
 ### Excluding noise from generated markdown
 

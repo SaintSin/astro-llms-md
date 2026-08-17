@@ -1,15 +1,43 @@
-import { access, mkdir, readFile, writeFile } from "fs/promises";
 import { glob } from "glob";
 import { parse } from "node-html-parser";
-import { dirname, join, resolve } from "path";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import TurndownService from "turndown";
 import { fileURLToPath } from "url";
 
-export type TrailingSlashMode = "always" | "never" | "ignore";
+/* ──────────────────────────────────────────────────────────────────────────────
+   Types
+   ───────────────────────────────────────────────────────────────────────────── */
 
-type BuildFormat = "directory" | "file" | "preserve";
+export interface SiteConfig {
+  base_url: string;
+  base_path?: string;
+  title: string;
+}
+
+export interface MetadataConfig {
+  meta_description?: string;
+}
+
+export interface LlmsInternalConfig {
+  generate_individual_md?: boolean;
+  generate_llms_txt?: boolean;
+  generate_llms_full_txt?: boolean;
+  title_selector?: string;
+  content_selector?: string;
+  exclude?: string[];
+  include?: string[];
+}
+
+export interface ProjectConfig {
+  site: SiteConfig;
+  metadata?: MetadataConfig;
+  llms: LlmsInternalConfig;
+}
 
 export interface LlmsIntegrationOptions {
+  configPath?: string;
   siteUrl?: string;
   name?: string;
   description?: string;
@@ -19,158 +47,151 @@ export interface LlmsIntegrationOptions {
   titleSelector?: string;
   contentSelector?: string;
   exclude?: string[];
-  excludeSelectors?: string[];
-  trailingSlash?: TrailingSlashMode;
-  verbose?: boolean;
-}
-
-export interface LlmsConfig {
-  inputDir: string;
-  outputDir: string;
-  siteUrl: string;
-  name?: string;
-  description?: string;
-  generateIndividualMd?: boolean;
-  generateLlmsTxt?: boolean;
-  generateLlmsFullTxt?: boolean;
-  titleSelector?: string;
-  contentSelector?: string;
-  exclude?: string[];
-  excludeSelectors?: string[];
-  trailingSlash?: TrailingSlashMode;
-  buildFormat?: BuildFormat;
+  include?: string[];
   verbose?: boolean;
 }
 
 export interface PageData {
   urlPath: string;
-  filePath: string;
+  filePath: string | null;
   title: string;
-  description?: string;
+  description: string;
   content: string;
+  source: "prerendered" | "ssr";
 }
 
-interface FormatterConfig {
-  name: string;
-  description: string;
-  siteUrl: string;
-  trailingSlash: TrailingSlashMode;
-  buildFormat: BuildFormat;
+export interface GenerateOptions {
+  config: ProjectConfig;
+  distFolder: string;
+  verbose?: boolean;
 }
 
-interface ProcessOptions {
-  titleSelector: string;
-  contentSelector: string;
-  excludeSelectors: string[];
-}
+/* ──────────────────────────────────────────────────────────────────────────────
+   Constants
+   ───────────────────────────────────────────────────────────────────────────── */
 
-interface ResolvedIntegrationConfig {
-  siteUrl: string;
-  name: string;
-  description: string;
-  generateIndividualMd: boolean;
-  generateLlmsTxt: boolean;
-  generateLlmsFullTxt: boolean;
-  titleSelector: string;
-  contentSelector: string;
-  exclude: string[];
-  excludeSelectors: string[];
-  trailingSlash: TrailingSlashMode;
-  buildFormat: BuildFormat;
-  verbose: boolean;
-}
-
-export const BUILT_IN_EXCLUDE_SELECTORS: readonly string[] = [
-  "script",
-  "style",
-  "[data-llms-ignore]",
+// ─── Default patterns to always skip ────────────────────────────────────────
+const DEFAULT_EXCLUDES = [
+  "node_modules",
+  "_astro",
+  "404",
+  "404.html",
+  "**/*.xml",
+  "**/*.txt",
 ];
 
-export const DEFAULT_NOISE_SELECTORS: readonly string[] = [
-  "nav",
-  "aside",
-  "footer",
-  "form",
-  "[aria-hidden='true']",
-  "[hidden]",
-];
+// ─── URL path prefixes that are API / system routes ──────────────────────────
+const API_ROUTE_PREFIXES = ["/api/", "/_", "/cdn-cgi/"];
+
+// ─── Temporary server management ──────────────────────────────────────────────
+const TEMP_PORT = 14321;
+const TEMP_HOST = "127.0.0.1";
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   Helpers
+   ───────────────────────────────────────────────────────────────────────────── */
+
+function isApiRoute(urlPath: string): boolean {
+  return API_ROUTE_PREFIXES.some((prefix) => urlPath.startsWith(prefix));
+}
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+export function getConfig(configPath?: string): ProjectConfig {
+  const CONFIG_PATH =
+    configPath ||
+    path.join(process.cwd(), "src", "config", "config.json");
+
+  if (!fs.existsSync(CONFIG_PATH)) {
+    throw new Error("config.json not found");
+  }
+
+  const config: ProjectConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+
+  if (!config.llms) {
+    throw new Error("llms configuration not found in config.json");
+  }
+
+  return config;
+}
+
+// ─── Path helpers ─────────────────────────────────────────────────────────────
 
 /**
- * Default configuration
+ * Returns the Astro static-asset output directory.
+ * In SSR mode (output: "server") Astro puts static files in dist/client/.
+ * In static mode (output: "static") they go directly in dist/.
  */
-const defaultConfig: ResolvedIntegrationConfig = {
-  siteUrl: "",
-  name: "",
-  description: "",
-  generateIndividualMd: true,
-  generateLlmsTxt: true,
-  generateLlmsFullTxt: true,
-  titleSelector: "h1",
-  contentSelector: "main",
-  exclude: ["404", "404.html", "_astro", "**.xml", "**.txt", "node_modules"],
-  excludeSelectors: [],
-  trailingSlash: "ignore",
-  buildFormat: "directory",
-  verbose: false,
-};
-
-function resolveTrailingSlash(
-  mode: TrailingSlashMode,
-  buildFormat: BuildFormat,
-): "always" | "never" {
-  if (mode === "always" || mode === "never") return mode;
-  return buildFormat === "file" ? "never" : "always";
-}
-
-function applyTrailingSlash(
-  url: string,
-  mode: TrailingSlashMode,
-  buildFormat: BuildFormat,
-): string {
-  const resolved = resolveTrailingSlash(mode, buildFormat);
-  if (resolved === "always") {
-    return url.endsWith("/") ? url : `${url}/`;
-  }
-  return url.replace(/\/+$/, "");
-}
-
-function markdownPath(urlPath: string): string {
-  return urlPath === "/" ? "/index.md" : `${urlPath}.md`;
-}
-
-function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
+export function getClientDir(distFolder: string): string {
+  const clientDir = path.join(distFolder, "client");
+  return fs.existsSync(clientDir) ? clientDir : distFolder;
 }
 
 /**
- * Discover HTML files in a directory
+ * Astro's `astro:build:done` hook receives dist/client/ for server builds.
+ * Normalize that hook path back to dist/ so SSR server and source paths resolve.
  */
-async function discoverHtmlFiles(
-  inputDir: string,
-  excludePatterns: string[],
+export function resolveDistFolder(buildOutputDir: string): string {
+  const resolvedDir = path.resolve(buildOutputDir);
+  const parentDir = path.dirname(resolvedDir);
+
+  if (
+    path.basename(resolvedDir) === "client" &&
+    fs.existsSync(path.join(parentDir, "server", "entry.mjs"))
+  ) {
+    return parentDir;
+  }
+
+  return resolvedDir;
+}
+
+export function normalizePattern(baseDir: string, pattern: string): string {
+  const cleanPattern = pattern.replace(/^\/+/,"");
+  const fullPath = path.join(baseDir, cleanPattern);
+
+  try {
+    if (fs.statSync(fullPath).isDirectory()) {
+      return path.join(fullPath, "**/*.html");
+    }
+  } catch {
+    // treat as glob pattern
+  }
+
+  return fullPath;
+}
+
+export async function discoverHtmlFiles(
+  clientDir: string,
+  excludePatterns?: string[],
+  includePatterns?: string[],
 ): Promise<string[]> {
-  const pattern = `${inputDir}/**/*.html`;
-  const files = await glob(pattern, {
-    ignore: excludePatterns.map((p) => `${inputDir}/${p}`),
-    absolute: true,
-  });
+  const patterns =
+    includePatterns && includePatterns.length > 0
+      ? includePatterns.map((p) => normalizePattern(clientDir, p))
+      : [path.join(clientDir, "**/*.html")];
+
+  const userExcludes = (excludePatterns || []).map((p) =>
+    normalizePattern(clientDir, p),
+  );
+
+  const ignore = [
+    ...DEFAULT_EXCLUDES.map((p) => path.join(clientDir, p)),
+    ...userExcludes,
+  ];
+
+  let files = await glob(patterns, { ignore, absolute: true });
+
+  files = files.filter((f) => fs.statSync(f).isFile() && f.endsWith(".html"));
+
   return files.sort();
 }
 
-/**
- * Convert file path to URL path
- */
-function fileToUrlPath(filePath: string, inputDir: string): string {
-  const relativePath = filePath.replace(resolve(inputDir), "");
+export function fileToUrlPath(filePath: string, clientDir: string): string {
+  const relativePath = filePath.replace(path.resolve(clientDir), "");
   let urlPath = relativePath.replace(/\\/g, "/").replace(/^\//, "");
 
-  // Remove .html extension
   urlPath = urlPath.replace(/\.html$/, "");
 
-  // Handle index files
   if (urlPath.endsWith("/index") || urlPath === "index") {
     urlPath = urlPath.replace(/\/index$/, "").replace(/^index$/, "");
   }
@@ -178,74 +199,278 @@ function fileToUrlPath(filePath: string, inputDir: string): string {
   return "/" + urlPath;
 }
 
-/**
- * Process a single HTML file
- */
-async function processHtmlFile(
-  filePath: string,
-  options: ProcessOptions,
-): Promise<Omit<PageData, "urlPath" | "filePath">> {
-  const { titleSelector, contentSelector, excludeSelectors } = options;
+// ─── HTML parsing helpers ─────────────────────────────────────────────────────
 
-  const html = await readFile(filePath, "utf8");
+export function getTitle(
+  root: ReturnType<typeof parse>,
+  titleSelector?: string,
+): string {
+  let el;
+  if (titleSelector) el = root.querySelector(titleSelector);
+  if (!el) el = root.querySelector("h1");
+  if (!el) el = root.querySelector("h2");
+  if (!el) el = root.querySelector("h3");
+  if (!el) el = root.querySelector("title");
+  return el?.text?.trim() || "";
+}
+
+export function getContentElement(
+  root: ReturnType<typeof parse>,
+  contentSelector?: string,
+): ReturnType<typeof parse> | null {
+  let el;
+  if (contentSelector) el = root.querySelector(contentSelector);
+  if (!el) el = root.querySelector("main");
+  if (!el) el = root.querySelector("body");
+  if (!el) el = root.querySelector("html");
+  return el;
+}
+
+export async function processHtml(
+  html: string,
+  llmsConfig?: LlmsInternalConfig,
+): Promise<Omit<PageData, "urlPath" | "filePath" | "source">> {
   const root = parse(html);
 
-  // Extract title
-  const titleElement = root.querySelector(titleSelector);
-  const title = titleElement?.text?.trim() || "";
+  const title = getTitle(root, llmsConfig?.title_selector);
 
-  // Extract description from meta tag
   const metaDescription = root.querySelector('meta[name="description"]');
   const description = metaDescription?.getAttribute("content") || "";
 
-  // Extract content
-  const contentElement = root.querySelector(contentSelector);
+  const contentElement = getContentElement(root, llmsConfig?.content_selector);
   let content = "";
 
   if (contentElement) {
-    // Strip noise elements before conversion. BUILT_IN_EXCLUDE_SELECTORS
-    // is always applied (script/style/[data-llms-ignore]); user-supplied
-    // selectors extend it. De-duped so explicit overlaps don't cost a
-    // second pass.
-    const selectors = Array.from(
-      new Set([...BUILT_IN_EXCLUDE_SELECTORS, ...excludeSelectors]),
-    ).join(", ");
-    if (selectors) {
-      contentElement.querySelectorAll(selectors).forEach((el) => el.remove());
-    }
+    contentElement
+      .querySelectorAll("script, style, noscript, iframe, svg")
+      .forEach((el) => el.remove());
 
-    // Convert HTML to markdown
     const turndownService = new TurndownService({
       headingStyle: "atx",
       codeBlockStyle: "fenced",
+      bulletListMarker: "-",
+    });
+
+    turndownService.addRule("removeChrome", {
+      filter: ["nav", "footer", "header", "aside"],
+      replacement: () => "",
     });
 
     content = turndownService.turndown(contentElement.innerHTML);
   }
 
-  return {
-    title,
-    description,
-    content,
-  };
+  return { title, description, content };
+}
+
+export async function processHtmlFile(
+  filePath: string,
+  llmsConfig?: LlmsInternalConfig,
+): Promise<Omit<PageData, "urlPath" | "filePath" | "source">> {
+  const html = fs.readFileSync(filePath, "utf8");
+  return processHtml(html, llmsConfig);
 }
 
 /**
- * Generate markdown file content for a page
+ * Fetches a page from a server and processes it as HTML.
+ * Returns null if the fetch fails or the page returns an error status.
  */
-function generateMarkdownFile(page: PageData, config: FormatterConfig): string {
-  const { siteUrl, trailingSlash, buildFormat } = config;
-  const url = applyTrailingSlash(
-    `${siteUrl}${page.urlPath}`,
-    trailingSlash,
-    buildFormat,
+export async function fetchAndProcessPage(
+  url: string,
+  llmsConfig?: LlmsInternalConfig,
+): Promise<Omit<PageData, "urlPath" | "filePath" | "source"> | null> {
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: "text/html" },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!response.ok) return null;
+
+    const html = await response.text();
+    return processHtml(html, llmsConfig);
+  } catch {
+    return null;
+  }
+}
+
+// ─── Temporary server management ──────────────────────────────────────────────
+
+/**
+ * Checks if a server is already reachable at the given URL.
+ */
+export async function isServerRunning(url: string): Promise<boolean> {
+  try {
+    const r = await fetch(url + "/", {
+      signal: AbortSignal.timeout(2_000),
+      headers: { Accept: "text/html" },
+    });
+    return r.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spawns dist/server/entry.mjs on TEMP_PORT and waits until it's ready.
+ * Returns { process, baseUrl } or null if it can't be started.
+ */
+export async function startTempServer(
+  distFolder: string,
+): Promise<{ process: ReturnType<typeof spawn>; baseUrl: string } | null> {
+  const entryPath = path.join(distFolder, "server", "entry.mjs");
+
+  if (!fs.existsSync(entryPath)) {
+    console.log(
+      "   ⚠️  No standalone server entry (dist/server/entry.mjs) found.",
+    );
+    return null;
+  }
+
+  console.log(
+    `   Spawning built server on port ${TEMP_PORT} to render SSR pages...`,
   );
 
+  const serverProcess = spawn(process.execPath, [entryPath], {
+    env: {
+      ...process.env,
+      PORT: String(TEMP_PORT),
+      HOST: TEMP_HOST,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+  });
+
+  serverProcess.stderr.on("data", (d) => {
+    // Suppress noise but keep it available for debugging
+    if (process.env.LLMS_DEBUG) process.stderr.write(d);
+  });
+
+  const tempBaseUrl = `http://${TEMP_HOST}:${TEMP_PORT}`;
+
+  // Poll until the server responds or timeout
+  const ready = await new Promise<boolean>((resolve) => {
+    const TIMEOUT_MS = 20_000;
+    const POLL_MS = 400;
+
+    const deadline = setTimeout(() => {
+      clearInterval(poll);
+      resolve(false);
+    }, TIMEOUT_MS);
+
+    const poll = setInterval(async () => {
+      try {
+        const r = await fetch(tempBaseUrl + "/", {
+          signal: AbortSignal.timeout(1_000),
+        });
+        if (r.status < 500) {
+          clearInterval(poll);
+          clearTimeout(deadline);
+          resolve(true);
+        }
+      } catch {
+        // not ready yet
+      }
+    }, POLL_MS);
+
+    serverProcess.on("error", () => {
+      clearInterval(poll);
+      clearTimeout(deadline);
+      resolve(false);
+    });
+
+    serverProcess.on("exit", (code) => {
+      if (code !== null) {
+        clearInterval(poll);
+        clearTimeout(deadline);
+        resolve(false);
+      }
+    });
+  });
+
+  if (!ready) {
+    console.log("   ⚠️  Temp server did not become ready in time.");
+    serverProcess.kill();
+    return null;
+  }
+
+  console.log(`   ✓ Temp server ready at ${tempBaseUrl}`);
+  return { process: serverProcess, baseUrl: tempBaseUrl };
+}
+
+export function stopTempServer(
+  serverHandle: { process: ReturnType<typeof spawn> } | null,
+): void {
+  if (serverHandle?.process) {
+    serverHandle.process.kill();
+    console.log("   Stopped temporary server.\n");
+  }
+}
+
+// ─── SSR page discovery from source ──────────────────────────────────────────
+
+/**
+ * Scans src/pages/ for static (non-dynamic) route files and returns their
+ * URL paths. Dynamic routes ([slug].astro) and the api/ folder are excluded
+ * since they either already have HTML files or are API-only.
+ */
+export function discoverSsrPageRoutes(
+  srcPagesDir: string,
+  basePath: string,
+): string[] {
+  if (!fs.existsSync(srcPagesDir)) return [];
+
+  const routes: string[] = [];
+
+  function scanDir(dir: string, urlPrefix: string) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const name = entry.name;
+
+      // Skip hidden items and the api/ directory
+      if (name.startsWith(".") || name === "api") continue;
+
+      const fullPath = path.join(dir, name);
+
+      if (entry.isDirectory()) {
+        scanDir(fullPath, `${urlPrefix}/${name}`);
+      } else if (
+        entry.isFile() &&
+        /\.(astro|md|mdx|ts|js)$/.test(name) &&
+        !name.startsWith("_") &&
+        !name.startsWith("[") // skip dynamic routes — they have per-entry HTML files
+      ) {
+        const stem = name.replace(/\.(astro|md|mdx|ts|js)$/, "");
+
+        if (stem === "404") continue;
+
+        const routePath =
+          stem === "index" ? urlPrefix || "/" : `${urlPrefix}/${stem}`;
+
+        const normalizedRoute = routePath || "/";
+
+        if (isApiRoute(normalizedRoute)) continue;
+
+        routes.push(normalizedRoute);
+      }
+    }
+  }
+
+  scanDir(srcPagesDir, basePath === "/" ? "" : basePath.replace(/\/$/, ""));
+
+  return [...new Set(routes)].sort();
+}
+
+// ─── Output generators ────────────────────────────────────────────────────────
+
+export function generateMarkdownFile(page: PageData, siteUrl: string): string {
+  const url = `${siteUrl}${page.urlPath}`.replace(/(?<=.)\/$/, "");
+
   let md = "---\n";
-  md += `title: "${page.title}"\n`;
+  md += `title: "${page.title.replace(/"/g, '\\"')}"\n`;
   md += `url: "${url}"\n`;
   if (page.description) {
-    md += `description: "${page.description}"\n`;
+    md += `description: "${page.description.replace(/"/g, '\\"')}"\n`;
   }
   md += "---\n\n";
   md += page.content;
@@ -253,78 +478,75 @@ function generateMarkdownFile(page: PageData, config: FormatterConfig): string {
   return md;
 }
 
-/**
- * Generate llms.txt content
- */
-function generateLlmsTxtContent(
+export function generateLlmsTxtContent(
   pages: PageData[],
-  config: FormatterConfig,
+  siteUrl: string,
+  siteName: string,
+  siteDescription: string,
+  generateIndividualMd: boolean,
 ): string {
-  const { name, description, siteUrl } = config;
+  let content = `# ${siteName}\n\n`;
 
-  let content = `# ${name}\n\n`;
-
-  if (description) {
-    content += `> ${description}\n\n`;
+  if (siteDescription) {
+    content += `> ${siteDescription}\n\n`;
   }
 
   content +=
     "This file helps language models discover the most useful content on this site.\n\n";
 
-  // Group pages by directory
   const grouped: Record<string, PageData[]> = {};
   pages.forEach((page) => {
     const parts = page.urlPath.split("/").filter(Boolean);
-    const group = parts.length > 1 ? parts[0] : "Home";
+    const group = parts.length === 0 ? "Home" : parts[0];
 
-    if (!grouped[group]) {
-      grouped[group] = [];
-    }
+    if (!grouped[group]) grouped[group] = [];
     grouped[group].push(page);
   });
 
-  // Generate sections
-  Object.keys(grouped)
-    .sort()
-    .forEach((group) => {
-      const groupName = group.charAt(0).toUpperCase() + group.slice(1);
-      content += `## ${groupName}\n\n`;
+  const sortedGroups = Object.keys(grouped).sort((a, b) => {
+    if (a === "Home") return -1;
+    if (b === "Home") return 1;
+    return a.localeCompare(b);
+  });
 
-      grouped[group].forEach((page) => {
-        const mdUrl = `${siteUrl}${markdownPath(page.urlPath)}`;
-        const linkText = page.title || page.urlPath;
+  sortedGroups.forEach((group) => {
+    const groupName = group.charAt(0).toUpperCase() + group.slice(1);
+    content += `## ${groupName}\n\n`;
 
-        if (page.description) {
-          content += `- [${linkText}](${mdUrl}): ${page.description}\n`;
-        } else {
-          content += `- [${linkText}](${mdUrl})\n`;
-        }
-      });
+    grouped[group].forEach((page) => {
+      let linkUrl: string;
+      if (generateIndividualMd) {
+        const mdPath =
+          page.urlPath === "/" ? "/home.md" : `${page.urlPath}.md`;
+        linkUrl = `${siteUrl}${mdPath}`.replace(/([^:])\/\//g, "$1/");
+      } else {
+        linkUrl = `${siteUrl}${page.urlPath}`.replace(/(?<=.)\/$/, "");
+      }
+      const linkText = page.title || page.urlPath;
 
-      content += "\n";
+      if (page.description) {
+        content += `- [${linkText}](${linkUrl}): ${page.description}\n`;
+      } else {
+        content += `- [${linkText}](${linkUrl})\n`;
+      }
     });
+
+    content += "\n";
+  });
 
   return content;
 }
 
-/**
- * Generate llms-full.txt content
- */
-function generateLlmsFullTxtContent(
+export function generateLlmsFullTxtContent(
   pages: PageData[],
-  config: FormatterConfig,
+  siteUrl: string,
+  siteName: string,
 ): string {
-  const { name, siteUrl, trailingSlash, buildFormat } = config;
-
-  let content = `# ${name}\n\n`;
-  content += `URL: ${applyTrailingSlash(siteUrl, trailingSlash, buildFormat)}\n\n`;
+  let content = `# ${siteName}\n\n`;
+  content += `URL: ${siteUrl}\n\n`;
 
   pages.forEach((page, index) => {
-    const url = applyTrailingSlash(
-      `${siteUrl}${page.urlPath}`,
-      trailingSlash,
-      buildFormat,
-    );
+    const url = `${siteUrl}${page.urlPath}`.replace(/(?<=.)\/$/, "");
     content += `## ${page.title}\n\n`;
     content += `URL: ${url}\n\n`;
 
@@ -342,186 +564,295 @@ function generateLlmsFullTxtContent(
   return content;
 }
 
-/**
- * Main function to generate all LLMS files
- */
-export async function generateLlmsFiles(config: LlmsConfig): Promise<void> {
-  const {
-    inputDir,
-    outputDir,
-    siteUrl,
-    name,
-    description,
-    generateIndividualMd = true,
-    generateLlmsTxt = true,
-    generateLlmsFullTxt = true,
-    titleSelector = "h1",
-    contentSelector = "main",
-    exclude = defaultConfig.exclude,
-    excludeSelectors = defaultConfig.excludeSelectors,
-    trailingSlash = defaultConfig.trailingSlash,
-    buildFormat = defaultConfig.buildFormat,
-    verbose = false,
-  } = config;
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
-  const resolvedInputDir = resolve(inputDir);
-  const resolvedOutputDir = resolve(outputDir);
+export async function generateLlmsFiles(options: GenerateOptions): Promise<void> {
+  const { config, distFolder, verbose = false } = options;
+  const llms = config.llms;
 
-  // Ensure output directory exists
-  try {
-    await access(resolvedOutputDir);
-  } catch {
-    throw new Error(`Output directory does not exist: ${outputDir}`);
+  if (!fs.existsSync(distFolder)) {
+    console.error("❌ dist/ folder does not exist. Run 'astro build' first.");
+    process.exit(1);
   }
 
-  if (verbose) {
-    console.log("🔍 Discovering HTML files...");
+  // In SSR mode static assets live in dist/client/; in static mode in dist/
+  const clientDir = getClientDir(distFolder);
+  const isSSR = clientDir !== distFolder;
+
+  const targetDirs = [clientDir];
+  const vercelStaticDir = path.join(
+    path.dirname(distFolder),
+    ".vercel",
+    "output",
+    "static",
+  );
+  if (fs.existsSync(vercelStaticDir)) {
+    targetDirs.push(vercelStaticDir);
   }
 
-  const htmlFiles = await discoverHtmlFiles(resolvedInputDir, exclude);
-
-  if (verbose) {
-    console.log(`   Found ${htmlFiles.length} HTML files`);
+  console.log(
+    `📂 Output mode: ${isSSR ? "SSR (dist/client)" : "Static (dist)"}`,
+  );
+  if (targetDirs.length > 1) {
+    console.log(
+      `📂 Target directories: ${targetDirs
+        .map((d) => path.relative(path.dirname(distFolder), d))
+        .join(", ")}`,
+    );
   }
 
-  // Process all HTML files
+  const siteUrl = config.site.base_url.replace(/\/$/, "");
+  const basePath = (config.site.base_path || "/").replace(/\/$/, "") || "/";
+  const siteName = config.site.title;
+  const siteDescription = config.metadata?.meta_description || "";
+
+  // Helper to write to all target directories
+  const writeToTargets = (relPath: string, content: string) => {
+    for (const dir of targetDirs) {
+      const fullPath = path.join(dir, relPath);
+      const parentDir = path.dirname(fullPath);
+      if (!fs.existsSync(parentDir)) {
+        fs.mkdirSync(parentDir, { recursive: true });
+      }
+      fs.writeFileSync(fullPath, content, "utf8");
+    }
+  };
+
+  // ── Step 1: Discover pre-rendered HTML files ────────────────────────────
+  console.log("\n🔍 Discovering pre-rendered HTML files...");
+  const htmlFiles = await discoverHtmlFiles(
+    clientDir,
+    llms.exclude,
+    llms.include,
+  );
+  console.log(`   Found ${htmlFiles.length} pre-rendered HTML files`);
+
   const pages: PageData[] = [];
+  const seenPaths = new Set<string>();
+
   for (const file of htmlFiles) {
     try {
-      const urlPath = fileToUrlPath(file, resolvedInputDir);
-      const pageData = await processHtmlFile(file, {
-        titleSelector,
-        contentSelector,
-        excludeSelectors,
-      });
+      const urlPath = fileToUrlPath(file, clientDir);
+
+      if (isApiRoute(urlPath)) {
+        console.log(`   ⤷ Skipping API route: ${urlPath}`);
+        continue;
+      }
+
+      if (seenPaths.has(urlPath)) continue;
+      seenPaths.add(urlPath);
+
+      const pageData = await processHtmlFile(file, llms);
 
       if (!pageData.title) {
-        if (verbose) {
-          console.log(`   ⚠️  Skipping ${urlPath} (no title found)`);
-        }
+        console.log(`   ⚠️  No title found for ${urlPath}, skipping`);
         continue;
       }
 
       pages.push({
         urlPath,
         filePath: file,
+        source: "prerendered",
         ...pageData,
       });
-
-      if (verbose) {
-        console.log(`   ✓ ${urlPath}: "${pageData.title}"`);
-      }
+      console.log(`   ✓ [static] ${urlPath}: "${pageData.title}"`);
     } catch (error) {
-      console.error(`   ✗ Error processing ${file}: ${getErrorMessage(error)}`);
+      console.error(
+        `   ✗ Error processing ${file}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
-  if (verbose) {
-    console.log(`   Processed ${pages.length} pages successfully\n`);
-  }
+  // ── Step 2: Fetch SSR-only pages ───────────────────────────────────────
+  if (isSSR) {
+    const srcPagesDir = path.join(path.dirname(distFolder), "src", "pages");
+    const ssrRoutes = discoverSsrPageRoutes(srcPagesDir, basePath);
+    const missingRoutes = ssrRoutes.filter((r) => !seenPaths.has(r));
 
-  // Infer site name and description from homepage
-  const homePage = pages.find((p) => p.urlPath === "/");
-  const siteName = name || homePage?.title || "Site";
-  const siteDescription = description || homePage?.description || "";
-
-  const formatterConfig: FormatterConfig = {
-    name: siteName,
-    description: siteDescription,
-    siteUrl: siteUrl.replace(/\/$/, ""),
-    trailingSlash,
-    buildFormat,
-  };
-
-  // Generate individual .md files
-  if (generateIndividualMd) {
-    if (verbose) {
-      console.log("📝 Generating individual .md files...");
-    }
-
-    for (const page of pages) {
-      const mdPath = join(
-        resolvedOutputDir,
-        markdownPath(page.urlPath).replace(/^\//, ""),
+    if (missingRoutes.length === 0) {
+      console.log("\n✓ All source routes already captured by static HTML.");
+    } else {
+      console.log(
+        `\n🌐 Fetching ${missingRoutes.length} SSR-only route(s): ${missingRoutes.join(", ")}`,
       );
 
-      const mdContent = generateMarkdownFile(page, formatterConfig);
+      // Determine which server to use: the configured siteUrl or a temp server
+      let fetchBase: string | null = null;
+      let tempServerHandle: { process: ReturnType<typeof spawn>; baseUrl: string } | null = null;
 
-      // Ensure directory exists
-      const mdDir = dirname(mdPath);
-      try {
-        await access(mdDir);
-      } catch {
-        await mkdir(mdDir, { recursive: true });
+      if (await isServerRunning(siteUrl)) {
+        fetchBase = siteUrl;
+        console.log(`   Using running server at ${fetchBase}`);
+      } else {
+        tempServerHandle = await startTempServer(distFolder);
+        if (tempServerHandle) {
+          fetchBase = tempServerHandle.baseUrl;
+        } else {
+          console.log(
+            "   ⚠️  No server available. SSR pages will be skipped.\n" +
+              "       Run 'yarn preview' before 'yarn generate-llms' to include them.",
+          );
+        }
       }
 
-      await writeFile(mdPath, mdContent, "utf8");
+      if (fetchBase) {
+        for (const route of missingRoutes) {
+          const url = `${fetchBase}${route}`;
+          process.stdout.write(`   ⤷ Fetching ${route} ... `);
 
-      if (verbose) {
-        console.log(`   ✓ ${mdPath}`);
+          const pageData = await fetchAndProcessPage(url, llms);
+
+          if (!pageData) {
+            console.log("❌ failed");
+            continue;
+          }
+
+          if (!pageData.title) {
+            console.log("⚠️  no title, skipping");
+            continue;
+          }
+
+          seenPaths.add(route);
+          pages.push({
+            urlPath: route,
+            filePath: null,
+            source: "ssr",
+            ...pageData,
+          });
+          console.log(`✓ "${pageData.title}"`);
+        }
       }
-    }
 
-    if (verbose) {
-      console.log(`   Created ${pages.length} .md files\n`);
+      stopTempServer(tempServerHandle);
     }
   }
 
-  // Generate llms.txt
-  if (generateLlmsTxt) {
-    if (verbose) {
-      console.log("📋 Generating llms.txt...");
+  // Sort pages: home first, then alphabetically
+  pages.sort((a, b) => {
+    if (a.urlPath === "/") return -1;
+    if (b.urlPath === "/") return 1;
+    return a.urlPath.localeCompare(b.urlPath);
+  });
+
+  console.log(`\n   ✅ Total pages processed: ${pages.length}\n`);
+
+  // ── Step 3: Generate individual .md files ──────────────────────────────
+  if (llms.generate_individual_md) {
+    console.log("📝 Generating individual .md files...");
+
+    for (const page of pages) {
+      // Home → home.md, everything else → <url-path>.md
+      const mdRelative =
+        page.urlPath === "/" ? "home" : page.urlPath.replace(/^\//, "");
+      const relPath = mdRelative + ".md";
+
+      const mdContent = generateMarkdownFile(page, siteUrl);
+      writeToTargets(relPath, mdContent);
+      console.log(`   ✓ ${relPath}`);
     }
 
-    const llmsTxtContent = generateLlmsTxtContent(pages, formatterConfig);
-    const llmsTxtPath = join(resolvedOutputDir, "llms.txt");
-
-    await writeFile(llmsTxtPath, llmsTxtContent, "utf8");
-
-    if (verbose) {
-      console.log(`   ✓ ${llmsTxtPath}\n`);
-    }
+    console.log(`   Created ${pages.length} .md files\n`);
   }
 
-  // Generate llms-full.txt
-  if (generateLlmsFullTxt) {
-    if (verbose) {
-      console.log("📚 Generating llms-full.txt...");
-    }
+  // ── Step 4: Generate llms.txt ──────────────────────────────────────────
+  if (llms.generate_llms_txt) {
+    console.log("📋 Generating llms.txt...");
 
-    const llmsFullContent = generateLlmsFullTxtContent(pages, formatterConfig);
-    const llmsFullPath = join(resolvedOutputDir, "llms-full.txt");
-
-    await writeFile(llmsFullPath, llmsFullContent, "utf8");
-
-    if (verbose) {
-      console.log(`   ✓ ${llmsFullPath}\n`);
-    }
+    const llmsTxtContent = generateLlmsTxtContent(
+      pages,
+      siteUrl,
+      siteName,
+      siteDescription,
+      !!llms.generate_individual_md,
+    );
+    writeToTargets("llms.txt", llmsTxtContent);
+    console.log(`   ✓ llms.txt\n`);
   }
 
-  console.log("✅ Done!");
-  console.log("");
+  // ── Step 5: Generate llms-full.txt ────────────────────────────────────
+  if (llms.generate_llms_full_txt) {
+    console.log("📚 Generating llms-full.txt...");
+
+    const llmsFullContent = generateLlmsFullTxtContent(
+      pages,
+      siteUrl,
+      siteName,
+    );
+    writeToTargets("llms-full.txt", llmsFullContent);
+    console.log(`   ✓ llms-full.txt\n`);
+  }
+
+  // ── Summary ────────────────────────────────────────────────────────────
+  console.log("✅ LLMS generation complete!\n");
   console.log("Summary:");
-  console.log(`  - Pages processed: ${pages.length}`);
-  if (generateIndividualMd) {
-    console.log(`  - .md files created: ${pages.length}`);
+  console.log(`  Pages processed : ${pages.length}`);
+  console.log(
+    `  Sources         : ${pages.filter((p) => p.source === "prerendered").length} static HTML, ${pages.filter((p) => p.source === "ssr").length} SSR-fetched`,
+  );
+  if (llms.generate_individual_md) {
+    console.log(
+      `  .md files       : ${pages.length} (in ${path.relative(distFolder, clientDir)}/)`,
+    );
   }
-  if (generateLlmsTxt) {
-    console.log(`  - llms.txt: ${outputDir}/llms.txt`);
+  if (llms.generate_llms_txt) {
+    console.log(
+      `  llms.txt        : ${path.relative(distFolder, path.join(clientDir, "llms.txt"))}`,
+    );
   }
-  if (generateLlmsFullTxt) {
-    console.log(`  - llms-full.txt: ${outputDir}/llms-full.txt`);
+  if (llms.generate_llms_full_txt) {
+    console.log(
+      `  llms-full.txt   : ${path.relative(distFolder, path.join(clientDir, "llms-full.txt"))}`,
+    );
   }
 }
 
+// ─── Astro integration wrapper ───────────────────────────────────────────────
+
 /**
- * Astro integration for generating llms.txt and markdown files
- * @param options - Integration options
+ * Maps camelCase integration options to the internal snake_case config shape
+ * used by the main generateLlmsFiles function.
+ */
+function mapOptionsToConfig(
+  options: LlmsIntegrationOptions,
+  astroSiteUrl: string,
+  astroBasePath: string,
+  projectConfig?: ProjectConfig,
+): ProjectConfig {
+  const projectLlms = projectConfig?.llms || {};
+
+  return {
+    site: {
+      base_url:
+        options.siteUrl ?? projectConfig?.site.base_url ?? astroSiteUrl ?? "",
+      base_path:
+        projectConfig?.site.base_path ?? astroBasePath ?? "/",
+      title: options.name ?? projectConfig?.site.title ?? "Site",
+    },
+    metadata: {
+      meta_description:
+        options.description ?? projectConfig?.metadata?.meta_description ?? "",
+    },
+    llms: {
+      generate_individual_md:
+        options.generateIndividualMd ?? projectLlms.generate_individual_md ?? true,
+      generate_llms_txt:
+        options.generateLlmsTxt ?? projectLlms.generate_llms_txt ?? true,
+      generate_llms_full_txt:
+        options.generateLlmsFullTxt ?? projectLlms.generate_llms_full_txt ?? true,
+      title_selector: options.titleSelector ?? projectLlms.title_selector,
+      content_selector: options.contentSelector ?? projectLlms.content_selector,
+      exclude: options.exclude ?? projectLlms.exclude ?? [],
+      include: options.include ?? projectLlms.include ?? [],
+    },
+  };
+}
+
+/**
+ * Astro integration for generating llms.txt and markdown files.
  */
 export default function llmsIntegration(options: LlmsIntegrationOptions = {}) {
   let astroSiteUrl = "";
-  let astroTrailingSlash: TrailingSlashMode | undefined;
-  let astroBuildFormat: BuildFormat | undefined;
+  let astroBasePath = "/";
 
   return {
     name: "astro-llms-md",
@@ -532,16 +863,15 @@ export default function llmsIntegration(options: LlmsIntegrationOptions = {}) {
       }: {
         config: {
           site?: URL | string;
-          trailingSlash?: TrailingSlashMode;
-          build?: { format?: BuildFormat };
+          base?: string;
+          trailingSlash?: string;
+          build?: { format?: string };
         };
         logger: { info: (message: string) => void };
       }) => {
         logger.info("Setting up astro-llms-md integration...");
-
         astroSiteUrl = config.site?.toString?.() || "";
-        astroTrailingSlash = config.trailingSlash;
-        astroBuildFormat = config.build?.format;
+        astroBasePath = config.base || "/";
       },
 
       "astro:build:done": async ({
@@ -558,44 +888,38 @@ export default function llmsIntegration(options: LlmsIntegrationOptions = {}) {
         logger.info("Generating llms.txt and markdown files...");
 
         try {
-          const distDir = fileURLToPath(dir);
-          const mergedOptions: ResolvedIntegrationConfig = {
-            ...defaultConfig,
-            trailingSlash: astroTrailingSlash ?? defaultConfig.trailingSlash,
-            buildFormat: astroBuildFormat ?? defaultConfig.buildFormat,
-            ...options,
-          };
+          const distDir = resolveDistFolder(fileURLToPath(dir));
+          const configPath =
+            options.configPath ||
+            path.join(process.cwd(), "src", "config", "config.json");
+          const projectConfig = fs.existsSync(configPath)
+            ? getConfig(configPath)
+            : undefined;
+          const mappedConfig = mapOptionsToConfig(
+            options,
+            astroSiteUrl,
+            astroBasePath,
+            projectConfig,
+          );
 
-          const finalConfig: LlmsConfig = {
-            inputDir: distDir,
-            outputDir: distDir,
-            siteUrl: mergedOptions.siteUrl || astroSiteUrl,
-            name: mergedOptions.name,
-            description: mergedOptions.description,
-            generateIndividualMd: mergedOptions.generateIndividualMd,
-            generateLlmsTxt: mergedOptions.generateLlmsTxt,
-            generateLlmsFullTxt: mergedOptions.generateLlmsFullTxt,
-            titleSelector: mergedOptions.titleSelector,
-            contentSelector: mergedOptions.contentSelector,
-            exclude: mergedOptions.exclude,
-            excludeSelectors: mergedOptions.excludeSelectors,
-            trailingSlash: mergedOptions.trailingSlash,
-            buildFormat: mergedOptions.buildFormat,
-            verbose: mergedOptions.verbose,
-          };
-
-          if (!finalConfig.siteUrl) {
+          if (!mappedConfig.site.base_url) {
             logger.warn(
               "No site URL found. Set `site` in astro.config.mjs or pass `siteUrl` to llms().",
             );
             return;
           }
 
-          await generateLlmsFiles(finalConfig);
+          await generateLlmsFiles({
+            config: mappedConfig,
+            distFolder: distDir,
+            verbose: options.verbose || false,
+          });
 
           logger.info("✅ astro-llms-md: Generation complete!");
         } catch (error) {
-          logger.error(`❌ astro-llms-md: ${getErrorMessage(error)}`);
+          const message =
+            error instanceof Error ? error.message : String(error);
+          logger.error(`❌ astro-llms-md: ${message}`);
           if (options.verbose && error instanceof Error) {
             logger.error(error.stack || "");
           }
